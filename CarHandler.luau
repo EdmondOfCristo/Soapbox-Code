@@ -4,12 +4,15 @@
 	CarHandler.lua
 
 	Server-side car controller.
+
 	Responsible for:
 	- Spawning cars
 	- Receiving player input
 	- Applying steering / drift physics
 	- Handling cleanup when player or car is destroyed
---]]
+
+	All server-side logic to prevent client-side cheating or movement overrides.
+]]
 
 -- RemoteEvent used to change the player's camera to the car
 local CameraChange = game.ReplicatedStorage.Remotes.ChangeCamera
@@ -29,26 +32,26 @@ local function DebugPrint(...)
 	end
 end
 
---[[
+--[[ 
 	Checks if the car is touching the ground.
 	Uses a raycast straight "down" relative to the car.
 	This allows proper behavior when the car is tilted.
---]]
+	WHY:
+	This prevents steering or physics calculations while in the air or flipping.
+]]
 local function IsCarGrounded(car)
 	local root = car.PrimaryPart
-	if not root then return false end
+	if not root then
+		return false
+	end
 
-	-- Start ray at the car's center
-	local origin = root.Position
+	local origin = root.Position -- Start ray at the car's center
 
-	-- Half height ensures ray reaches below the car body
-	local halfHeight = root.Size.Y / 2
+	local halfHeight = root.Size.Y / 2 -- Half height ensures ray reaches below the car body
 
-	-- Down direction relative to the car's orientation
-	local localDown = -root.CFrame.UpVector
+	local localDown = -root.CFrame.UpVector -- Down direction relative to the car's orientation (accounts for tilt)
 
-	-- Slight buffer to guarantee ground detection
-	local rayDistance = halfHeight + 0.1
+	local rayDistance = halfHeight + 0.1 -- Slight buffer to guarantee ground detection
 	local direction = localDown * rayDistance
 
 	-- Raycast settings
@@ -63,10 +66,12 @@ local function IsCarGrounded(car)
 	return result ~= nil
 end
 
---[[
+--[[ 
 	Adds a BodyAngularVelocity to the car.
 	This is used to rotate the car visually based on velocity direction.
---]]
+	WHY:
+	Simulates car steering visually. Only applies torque on Y axis (yaw).
+]]
 local function AddAngularControl(car)
 	local root = car.PrimaryPart
 
@@ -88,10 +93,10 @@ function CarHandler:GetCarModel(player)
 	return "Car1" -- would normally come from player data / datastore
 end
 
---[[
+--[[ 
 	Spawns a car for a specific player.
 	Sets up input handling, physics loop, and cleanup.
---]]
+]]
 function CarHandler:SpawnCar(Plr, SpawnPoint)
 	local Car = CarHandler:GetCarModel(Plr)
 	local CarModel = game.ReplicatedStorage.Cars:FindFirstChild(Car)
@@ -123,14 +128,19 @@ function CarHandler:SpawnCar(Plr, SpawnPoint)
 
 	-- Receive input from client and update state flags
 	InputConnection = InputRemote.OnServerEvent:Connect(function(player, input, action)
-		if player ~= Plr then return end
+		if player ~= Plr then
+			return
+		end
 
 		if input == "Left" then
 			Left = action == "On"
+
 		elseif input == "Right" then
 			Right = action == "On"
+
 		elseif input == "Brake" then
 			Brake = action == "On"
+
 		elseif input == "Drift" then
 			Drift = action == "On"
 		end
@@ -168,13 +178,14 @@ function CarHandler:SpawnCar(Plr, SpawnPoint)
 		while CarClone.Parent do
 			task.wait(LoopSpeed)
 
-			-- Delta time calculation
 			local now = tick()
 			local dt = now - lastTime
 			lastTime = now
 
 			local root = CarClone.PrimaryPart
-			if not root then continue end
+			if not root then
+				continue
+			end
 
 			local vel = root.AssemblyLinearVelocity
 			local speed = vel.Magnitude
@@ -203,8 +214,14 @@ function CarHandler:SpawnCar(Plr, SpawnPoint)
 
 			-- Determine desired steering direction
 			local targetSteer = 0
-			if Left then targetSteer += 1 end
-			if Right then targetSteer -= 1 end
+
+			if Left then
+				targetSteer += 1
+			end
+
+			if Right then
+				targetSteer -= 1
+			end
 
 			-- Steering effectiveness curve based on speed
 			local steerEffect = 1 - math.abs(speed - PeakSteerSpeed) / PeakSteerSpeed
@@ -223,12 +240,11 @@ function CarHandler:SpawnCar(Plr, SpawnPoint)
 
 			-- Smoothly interpolate steering input
 			local steerDelta = targetSteer - Steering
-			Steering +=
-				math.sign(steerDelta)
-				* (math.abs(steerDelta) ^ 1.5)
-				* SteeringResponse
-				* dt
 
+			local steerSign = math.sign(steerDelta)
+			local steerMagnitude = math.abs(steerDelta) ^ 1.5
+
+			Steering += steerSign * steerMagnitude * SteeringResponse * dt
 			Steering = math.clamp(Steering, -1, 1)
 
 			-- =============================
@@ -241,12 +257,10 @@ function CarHandler:SpawnCar(Plr, SpawnPoint)
 				local carCFrame = root.CFrame
 
 				-- Convert velocity into car-local space
-				-- (forward/back/sideways relative to the car)
 				local localVelocity =
 					carCFrame:VectorToObjectSpace(vel)
 
 				-- Rotate local velocity by steering angle
-				-- This simulates the direction the wheels are pointing
 				local rotatedLocalVelocity =
 					CFrame.Angles(0, angle, 0):VectorToWorldSpace(localVelocity)
 
@@ -255,7 +269,6 @@ function CarHandler:SpawnCar(Plr, SpawnPoint)
 					carCFrame:VectorToWorldSpace(rotatedLocalVelocity)
 
 				-- Blend current direction with desired direction
-				-- Traction controls how strongly the car follows steering
 				local blendedDir =
 					vel.Unit:Lerp(desiredVelocity.Unit, traction)
 
@@ -275,6 +288,7 @@ function CarHandler:SpawnCar(Plr, SpawnPoint)
 			-- ROTATION FROM MOVEMENT DIRECTION
 			-- =============================
 			local flatVel = Vector3.new(vel.X, 0, vel.Z)
+
 			if flatVel.Magnitude > 1 then
 				local currDir = flatVel.Unit
 
