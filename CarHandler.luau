@@ -3,216 +3,314 @@
 
 	CarHandler.lua
 
-	Server-side car controller.
+	Server side vehicle controller.
+	
+	Handles car spawning, input syncing, drift + steering physics, and cleanup.
+	Does NOT trust the client with any physics to prevent exploits or speed hacks.
 
-	Responsible for:
-	- Spawning cars
-	- Receiving player input
-	- Applying steering / drift physics
-	- Handling cleanup when player or car is destroyed
-
-	All server-side logic to prevent client-side cheating or movement overrides.
+	WHY:
+	All movement logic is server authoritative for cheat prevention.
+	Client only handles input and camera behavior.
 ]]
 
--- RemoteEvent used to change the player's camera to the car
-local CameraChange = game.ReplicatedStorage.Remotes.ChangeCamera
+--------------------------------------------------
+-- Service References
+--------------------------------------------------
 
--- RemoteEvent used to receive driving inputs from the client
-local InputRemote = game.ReplicatedStorage.Remotes.Input
+-- Always access services via game:GetService for consistency and performance.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
 
+--------------------------------------------------
+-- RemoteEvent References
+--------------------------------------------------
+
+-- This RemoteEvent tells the client to switch their camera to the car.
+-- WHY: Clients must control their camera locally for smooth following.
+local CameraChange = ReplicatedStorage.Remotes:WaitForChild("ChangeCamera")
+
+-- This RemoteEvent listens for driving input from the client (WASD, etc).
+-- WHY: Input is gathered client side and interpreted server side for physics.
+local InputRemote = ReplicatedStorage.Remotes:WaitForChild("Input")
+
+--------------------------------------------------
+--  Module Table
+--------------------------------------------------
+
+-- Standard Lua module pattern: all exported functions live in this table.
 local CarHandler = {}
 
--- Enables debug prints when true
+--------------------------------------------------
+-- Debug Mode Toggle
+--------------------------------------------------
+
+-- Developers can toggle this to print useful information.
+-- WHY: Useful for diagnosing behavior during development.
 local DEBUG = false
 
--- Wrapper function to avoid spamming output unless debugging
+-- This utility function only prints messages if DEBUG is true.
+-- WHY: Prevents spam in production, keeps dev logs clean.
 local function DebugPrint(...)
 	if DEBUG then
 		print("[CarHandler]", ...)
 	end
 end
 
---[[ 
-	Checks if the car is touching the ground.
-	Uses a raycast straight "down" relative to the car.
-	This allows proper behavior when the car is tilted.
-	WHY:
-	This prevents steering or physics calculations while in the air or flipping.
-]]
+--------------------------------------------------
+-- Ground Check Function
+--------------------------------------------------
+
+-- This function determines if a car is grounded (touching terrain or parts).
+-- WHY: Prevents drift or steering logic while the car is airborne.
 local function IsCarGrounded(car)
 	local root = car.PrimaryPart
+
+	-- Sanity check: car must have a PrimaryPart set.
 	if not root then
 		return false
 	end
 
-	local origin = root.Position -- Start ray at the car's center
+	-- The ray starts from the center of the car.
+	local origin = root.Position
 
-	local halfHeight = root.Size.Y / 2 -- Half height ensures ray reaches below the car body
+	-- Calculates ray distance slightly longer than half the car height.
+	-- WHY: Ensures accurate contact even when barely off the ground.
+	local halfHeight = root.Size.Y / 2
+	local rayDistance = halfHeight + 0.1
 
-	local localDown = -root.CFrame.UpVector -- Down direction relative to the car's orientation (accounts for tilt)
+	-- Casts ray in the car's "down" direction relative to its orientation.
+	local direction = -root.CFrame.UpVector * rayDistance
 
-	local rayDistance = halfHeight + 0.1 -- Slight buffer to guarantee ground detection
-	local direction = localDown * rayDistance
-
-	-- Raycast settings
+	-- Raycast config: ignore the car itself and ignore water.
 	local params = RaycastParams.new()
-	params.FilterDescendantsInstances = { car } -- ignore the car itself
+	params.FilterDescendantsInstances = { car }
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	params.IgnoreWater = true
 
-	local result = workspace:Raycast(origin, direction, params)
+	-- Perform the raycast into the world.
+	local result = Workspace:Raycast(origin, direction, params)
 
-	-- If the ray hit anything, the car is grounded
+	-- Returns true if the ray hits any valid surface.
 	return result ~= nil
 end
 
---[[ 
-	Adds a BodyAngularVelocity to the car.
-	This is used to rotate the car visually based on velocity direction.
-	WHY:
-	Simulates car steering visually. Only applies torque on Y axis (yaw).
-]]
+--------------------------------------------------
+-- BodyAngularVelocity Setup
+--------------------------------------------------
+
+-- Creates and attaches a BodyAngularVelocity to the car's PrimaryPart.
+-- WHY: Allows car to smoothly rotate visually based on direction changes.
 local function AddAngularControl(car)
 	local root = car.PrimaryPart
 
 	local angular = Instance.new("BodyAngularVelocity")
 	angular.Name = "SteeringAngular"
 
-	-- Only allow Y-axis rotation (yaw)
+	-- Limits torque to only rotate around the Y axis (no barrel rolls).
 	angular.MaxTorque = Vector3.new(0, math.huge, 0)
 
+	-- Start with zero rotation.
 	angular.AngularVelocity = Vector3.zero
-	angular.P = 50000 -- responsiveness of angular force
+
+	-- High P value = snappy but smooth responsiveness.
+	angular.P = 50000
+
+	-- Attach to the car's main body (PrimaryPart).
 	angular.Parent = root
 
 	return angular
 end
 
--- Placeholder function for future data-based car selection
+--------------------------------------------------
+-- Car Selection
+--------------------------------------------------
+
+-- Returns the name of the car a player should spawn.
+-- WHY: Allows future support for unlockable cars, skins, or DataStore logic.
 function CarHandler:GetCarModel(player)
-	return "Car1" -- would normally come from player data / datastore
+	return "Car1" -- Static for now; replace with player data logic later.
 end
 
---[[ 
-	Spawns a car for a specific player.
-	Sets up input handling, physics loop, and cleanup.
-]]
-function CarHandler:SpawnCar(Plr, SpawnPoint)
-	local Car = CarHandler:GetCarModel(Plr)
-	local CarModel = game.ReplicatedStorage.Cars:FindFirstChild(Car)
+--------------------------------------------------
+-- Car Spawning Per Player
+--------------------------------------------------
 
-	-- Validate the car model
-	if not (CarModel and CarModel:IsA("Model") and CarModel.PrimaryPart) then
-		warn(Car .. " is invalid or missing PrimaryPart")
+-- Public method to spawn a car for the given player.
+function CarHandler:SpawnCar(player)
+	-- Get the car name for the player.
+	local carName = self:GetCarModel(player)
+
+	-- Look for the car model inside ReplicatedStorage.
+	local carModel = ReplicatedStorage.Cars:FindFirstChild(carName)
+
+	-- Validate the car: must exist, be a Model, and have a PrimaryPart set.
+	if not (carModel and carModel:IsA("Model") and carModel.PrimaryPart) then
+		warn(carName .. " is invalid or missing PrimaryPart")
 		return
 	end
 
-	-- Clone and place the car
-	local CarClone = CarModel:Clone()
-	CarClone.Parent = workspace.Map.Cars
-	CarClone:PivotTo(workspace.Map.SpawnPart.CFrame)
+	-- Clone the car so each player gets an independent copy.
+	local carClone = carModel:Clone()
 
-	-- Safety: wait for PrimaryPart replication if needed
-	if not CarClone.PrimaryPart then
-		CarClone:GetPropertyChangedSignal("PrimaryPart"):Wait()
+	-- Parent the car into the game world (grouped under Map.Cars for organization).
+	carClone.Parent = Workspace.Map.Cars
+
+	-- Move the car to the spawn location.
+	carClone:PivotTo(Workspace.Map.SpawnPart.CFrame)
+
+	-- If PrimaryPart hasn't replicated yet (possible over network), wait for it.
+	if not carClone.PrimaryPart then
+		carClone:GetPropertyChangedSignal("PrimaryPart"):Wait()
 	end
 
-	DebugPrint("Car spawned for", Plr.Name)
+	-- Tell the client to switch their camera to follow this new car.
+	CameraChange:FireClient(player, carClone, "Hitbox")
 
-	-- Switch the player's camera to follow the car
-	CameraChange:FireClient(Plr, CarClone, "Hitbox")
+	--------------------------------------------------
+	-- ⌨️ Input State Flags
+	--------------------------------------------------
 
-	-- Input state flags
+	-- These booleans store current input from the player.
+	-- WHY: Server tracks input to apply movement safely and securely.
 	local Left, Right, Brake, Drift = false, false, false, false
+
+	-- Input connection object (to disconnect later).
 	local InputConnection
 
-	-- Receive input from client and update state flags
-	InputConnection = InputRemote.OnServerEvent:Connect(function(player, input, action)
-		if player ~= Plr then
-			return
-		end
+	-- Connect to input RemoteEvent to listen for real time input updates.
+	InputConnection = InputRemote.OnServerEvent:Connect(function(plr, input, action)
+		if plr ~= player then return end
 
 		if input == "Left" then
 			Left = action == "On"
-
 		elseif input == "Right" then
 			Right = action == "On"
-
 		elseif input == "Brake" then
 			Brake = action == "On"
-
 		elseif input == "Drift" then
 			Drift = action == "On"
 		end
 	end)
 
-	-- Steering angular controller
-	local SteeringAngular = AddAngularControl(CarClone)
+	--------------------------------------------------
+	-- Steering Angular Velocity Setup
+	--------------------------------------------------
 
-	-- =============================
-	-- TUNING VALUES
-	-- =============================
-	local LoopSpeed = nil -- nil = run every frame
-	local TurnAmount = 0.015
-	local MaxSpeed = 120
+	local SteeringAngular = AddAngularControl(carClone)
+
+	--------------------------------------------------
+	-- Tuning Constants (Gameplay Feel)
+	--------------------------------------------------
+
+	-- These values affect handling responsiveness, grip, braking, etc.
 	local PeakSteerSpeed = 80
 	local MaxSteerAngle = math.rad(3)
 	local MinSteerAngle = math.rad(1.2)
-	local MaxSteerRate = 10
-	local MinSteerRate = 6
 	local NormalTraction = 1
 	local DriftTraction = 0.1
 	local DriftMultiplier = 1.8
 	local BrakeStrength = 0.98
 	local SteeringResponse = 1
-	local Steering = 0 -- current steering interpolation value
 
-	-- Main physics loop
+	-- Steering value (smoothed over time)
+	local Steering = 0
+
+	--------------------------------------------------
+	-- Main Physics Loop
+	--------------------------------------------------
+
 	task.spawn(function()
-		local prevFlatDir = nil -- last horizontal movement direction
+		-- Stores the previous horizontal movement direction
+		-- WHY: compare past and current direction to calculate turning rotation
+		local prevFlatDir = nil
+
+		-- Stores the last timestamp for deltaTime calculation
+		-- WHY: deltaTime ensures physics behaves consistently across different frame rates
 		local lastTime = tick()
+
+		-- Stores velocity from the previous frame
+		-- WHY: Used to detect sudden velocity changes (crash detection)
 		local lastVelocity = Vector3.zero
-		local prevPos = CarClone.PrimaryPart.Position
+
+		-- Stores the last position of the car
+		-- WHY: Used to measure how far the car has traveled
+		local prevPos = carClone.PrimaryPart.Position
+
+		-- Accumulates total distance traveled
+		-- WHY: Useful for debugging, stats, or race tracking
 		local distance = 0
 
-		while CarClone.Parent do
-			task.wait(LoopSpeed)
+		-- Run the loop as long as the car exists in the world
+		while carClone.Parent do
+			-- Yield briefly so the loop runs every frame without freezing the server
+			task.wait()
 
+			-- Get the current timestamp
 			local now = tick()
+
+			-- Calculate how much time passed since the last frame
+			-- WHY: Physics calculations must scale with time, not frames
 			local dt = now - lastTime
 			lastTime = now
 
-			local root = CarClone.PrimaryPart
+			-- Reference the car’s PrimaryPart for physics manipulation
+			local root = carClone.PrimaryPart
+
+			-- Skip this frame if the car is not fully initialized
 			if not root then
 				continue
 			end
 
+			-- Get the car’s current velocity
+			-- WHY: All steering and movement logic is based on velocity, not position
 			local vel = root.AssemblyLinearVelocity
+
+			-- Calculate speed from velocity magnitude
+			-- WHY: Steering behavior changes depending on how fast the car is moving
 			local speed = vel.Magnitude
 
-			-- Disable steering when almost stopped
+			-- Prevent steering and rotation when the car is nearly stopped
+			-- WHY: Turning in place looks unnatural and causes physics jitter
 			if speed < 0.5 then
 				SteeringAngular.AngularVelocity = Vector3.zero
 				prevFlatDir = nil
 				continue
 			end
 
-			local grounded = IsCarGrounded(CarClone)
+			-- Check if the car is touching the ground
+			-- WHY: Steering in mid air would feel unrealistic and broken
+			local grounded = IsCarGrounded(carClone)
 
-			-- Track distance traveled
+			-- Track how far the car has moved since the last frame
+			-- WHY: Useful for debugging, scoring, or race progress
 			local currentPos = root.Position
 			distance += (currentPos - prevPos).Magnitude
 			prevPos = currentPos
 
-			DebugPrint("Distance traveled by", Plr.Name, ":", math.floor(distance))
+			DebugPrint("Distance traveled:", math.floor(distance))
 
-			-- Brake reduces velocity multiplicatively
+			------------------------------------------------------------
+			-- BRAKING SYSTEM
+			------------------------------------------------------------
+
+			-- If the player is holding the brake input
 			if Brake then
+				-- Reduce velocity using a multiplier instead of setting it to zero
+				-- WHY: Gradual deceleration feels more realistic than instant stopping
 				vel *= BrakeStrength
+
+				-- Recalculate speed after braking
+				-- WHY: Speed affects steering sensitivity later in the loop
 				speed = vel.Magnitude
 			end
 
-			-- Determine desired steering direction
+			------------------------------------------------------------
+			-- STEERING INPUT PROCESSING
+			------------------------------------------------------------
+
+			-- Target steering direction based on player input
+			-- WHY: convert raw inputs into a single steering value
 			local targetSteer = 0
 
 			if Left then
@@ -223,52 +321,64 @@ function CarHandler:SpawnCar(Plr, SpawnPoint)
 				targetSteer -= 1
 			end
 
-			-- Steering effectiveness curve based on speed
+			-- Calculate how effective steering should be at the current speed
+			-- WHY: Cars should turn less sharply at very low or very high speeds
 			local steerEffect = 1 - math.abs(speed - PeakSteerSpeed) / PeakSteerSpeed
 			steerEffect = math.clamp(steerEffect, 0, 1)
 
+			-- Blend between min and max steering angles
+			-- WHY: Creates speed based steering sensitivity
 			local maxSteerAngle =
 				MinSteerAngle + (MaxSteerAngle - MinSteerAngle) * steerEffect
 
-			local steerRate =
-				MinSteerRate + (MaxSteerRate - MinSteerRate) * steerEffect
-
-			-- Drifting increases steering angle
+			-- Increase steering angle while drifting
+			-- WHY: Drifting should allow sharper turns with less traction
 			if Drift then
 				maxSteerAngle *= DriftMultiplier
 			end
 
-			-- Smoothly interpolate steering input
+			-- Smooth steering toward the target value
+			-- WHY: Prevents instant snapping when the player taps a key
 			local steerDelta = targetSteer - Steering
-
 			local steerSign = math.sign(steerDelta)
 			local steerMagnitude = math.abs(steerDelta) ^ 1.5
 
+			-- Apply time scaled steering interpolation
 			Steering += steerSign * steerMagnitude * SteeringResponse * dt
 			Steering = math.clamp(Steering, -1, 1)
 
-			-- =============================
-			-- CFRAME / VELOCITY STEERING MATH
-			-- =============================
+			------------------------------------------------------------
+			-- APPLY STEERING TO VELOCITY (REALISTIC TURNING)
+			------------------------------------------------------------
+
+			-- Only steer if the car is grounded and the player is turning
+			-- WHY: Prevents mid air turning and unnecessary calculations
 			if grounded and math.abs(Steering) > 0.001 then
+				-- Choose traction based on drift state
+				-- WHY: Drifting reduces grip to allow sliding
 				local traction = Drift and DriftTraction or NormalTraction
+
+				-- Calculate the steering rotation angle
 				local angle = maxSteerAngle * Steering
 
+				-- Store the car’s orientation
 				local carCFrame = root.CFrame
 
-				-- Convert velocity into car-local space
-				local localVelocity =
-					carCFrame:VectorToObjectSpace(vel)
+				-- Convert velocity into the car’s local space
+				-- WHY: Steering is easier to apply in the car’s forward/right directions
+				local localVelocity = carCFrame:VectorToObjectSpace(vel)
 
-				-- Rotate local velocity by steering angle
+				-- Rotate the velocity by the steering angle
+				-- WHY: Simulates the wheels changing direction
 				local rotatedLocalVelocity =
 					CFrame.Angles(0, angle, 0):VectorToWorldSpace(localVelocity)
 
-				-- Convert rotated velocity back into world space
+				-- Convert the rotated velocity back to world space
 				local desiredVelocity =
 					carCFrame:VectorToWorldSpace(rotatedLocalVelocity)
 
-				-- Blend current direction with desired direction
+				-- Blend between current and desired directions
+				-- WHY: Traction controls how much the car “slides” vs “grips”
 				local blendedDir =
 					vel.Unit:Lerp(desiredVelocity.Unit, traction)
 
@@ -279,14 +389,18 @@ function CarHandler:SpawnCar(Plr, SpawnPoint)
 					blendedDir = desiredVelocity.Unit
 				end
 
-				-- Apply new direction without changing speed
+				-- Apply the new direction while preserving speed
+				-- WHY: Steering should change direction, not velocity magnitude
 				vel = blendedDir * speed
 				root.AssemblyLinearVelocity = vel
 			end
 
-			-- =============================
-			-- ROTATION FROM MOVEMENT DIRECTION
-			-- =============================
+			------------------------------------------------------------
+			-- ROTATE CAR TO MATCH MOVEMENT DIRECTION
+			------------------------------------------------------------
+
+			-- Remove vertical movement from velocity
+			-- WHY: only want horizontal turning rotation
 			local flatVel = Vector3.new(vel.X, 0, vel.Z)
 
 			if flatVel.Magnitude > 1 then
@@ -294,14 +408,17 @@ function CarHandler:SpawnCar(Plr, SpawnPoint)
 
 				if prevFlatDir then
 					-- Dot & cross determine signed angle between directions
+					-- WHY: Allows us to calculate rotation direction and magnitude
 					local dot = currDir:Dot(prevFlatDir)
 					local cross = prevFlatDir:Cross(currDir)
 
-					-- atan2 gives rotation direction and magnitude
+					-- atan2 gives a stable signed angle
 					local angleDelta = math.atan2(cross.Y, dot)
+
+					-- Convert angle into angular speed
 					local angularSpeed = angleDelta / dt
 
-					-- Rotate car to face movement direction
+					-- Rotate the car visually
 					SteeringAngular.AngularVelocity =
 						Vector3.new(0, angularSpeed, 0)
 				end
@@ -312,94 +429,87 @@ function CarHandler:SpawnCar(Plr, SpawnPoint)
 				prevFlatDir = nil
 			end
 
-			-- =============================
+			------------------------------------------------------------
 			-- AUTO-FLIP SYSTEM
-			-- =============================
-			if grounded then
-				local upDot =
-					root.CFrame.UpVector:Dot(Vector3.new(0, 1, 0))
+			------------------------------------------------------------
 
-				-- If the car is upside down
+			if grounded then
+				-- Check if the car is upside down
+				-- WHY: Prevents players from getting stuck permanently
+				local upDot = root.CFrame.UpVector:Dot(Vector3.new(0, 1, 0))
+
 				if upDot < 0.2 then
 					DebugPrint("Car flipped. Auto-flipping.")
 
 					local pos = root.Position
-					local newCF =
-						CFrame.new(pos)
-						* CFrame.Angles(0, math.rad(root.Orientation.Y), 0)
 
-					-- Lift slightly to avoid ground collision
-					CarClone:PivotTo(newCF + Vector3.new(0, 3, 0))
+					-- Reset orientation while keeping yaw direction
+					local newCF =
+						CFrame.new(pos) *
+						CFrame.Angles(0, math.rad(root.Orientation.Y), 0)
+
+					-- Lift the car slightly to avoid ground clipping
+					carClone:PivotTo(newCF + Vector3.new(0, 3, 0))
 				end
 			end
 
-			-- =============================
+			------------------------------------------------------------
 			-- CRASH DETECTION
-			-- =============================
+			------------------------------------------------------------
+
+			-- Measure sudden velocity change
+			-- WHY: Large changes indicate collisions
 			local velocityChange = (lastVelocity - vel).Magnitude
+
 			if velocityChange > 50 then
-				DebugPrint(
-					"Crash detected for",
-					Plr.Name,
-					"- ΔV:",
-					velocityChange
-				)
+				DebugPrint("Crash detected for", player.Name)
 			end
 
+			-- Store velocity for the next frame
 			lastVelocity = vel
 		end
 	end)
 
-	-- =============================
-	-- CLEANUP
-	-- =============================
-	local CarDestroyingCleanup
-	local PlrLeavingCleanup
+	--------------------------------------------------
+	-- Cleanup Logic
+	--------------------------------------------------
 
-	CarDestroyingCleanup = CarClone.Destroying:Connect(function()
-		if CarDestroyingCleanup then
-			CarDestroyingCleanup:Disconnect()
-			CarDestroyingCleanup = nil
-		end
-
-		if PlrLeavingCleanup then
-			PlrLeavingCleanup:Disconnect()
-			PlrLeavingCleanup = nil
-		end
-
+	-- Helper to disconnect all input when car or player is destroyed.
+	local function DisconnectAll()
 		if InputConnection then
 			InputConnection:Disconnect()
 			InputConnection = nil
 		end
-	end)
+	end
 
-	PlrLeavingCleanup = Plr.Destroying:Connect(function()
-		CarClone:Destroy()
+	-- If the car gets destroyed manually or otherwise, clean up.
+	carClone.Destroying:Connect(DisconnectAll)
 
-		if PlrLeavingCleanup then
-			PlrLeavingCleanup:Disconnect()
-			PlrLeavingCleanup = nil
-		end
-
-		if CarDestroyingCleanup then
-			CarDestroyingCleanup:Disconnect()
-			CarDestroyingCleanup = nil
-		end
-
-		if InputConnection then
-			InputConnection:Disconnect()
-			InputConnection = nil
-		end
+	-- If the player leaves, destroy the car and clean up.
+	player.Destroying:Connect(function()
+		carClone:Destroy()
+		DisconnectAll()
 	end)
 end
 
--- Spawns cars for all players at the start of a round
-function CarHandler:StartRound()
-	workspace.Map.Cars:ClearAllChildren()
+--------------------------------------------------
+-- Start Round (Spawns Cars for All Players)
+--------------------------------------------------
 
-	for _, player in pairs(game.Players:GetPlayers()) do
-		CarHandler:SpawnCar(player)
+-- Spawns cars for everyone at the start of a race or round.
+function CarHandler:StartRound()
+	-- Clear old car models from previous rounds.
+	Workspace.Map.Cars:ClearAllChildren()
+
+	-- Spawn a car for each connected player.
+	for _, player in ipairs(Players:GetPlayers()) do
+		self:SpawnCar(player)
 	end
 end
 
+--------------------------------------------------
+-- Return Module
+--------------------------------------------------
+
+-- Returns the CarHandler table so other scripts can use it.
 return CarHandler
